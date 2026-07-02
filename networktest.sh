@@ -8,7 +8,7 @@
 #       bash networktest.sh --help    # 查看全部参数
 #=======================================================================
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 #-----------------------------------------------------------------------
 # 颜色与输出
@@ -96,35 +96,35 @@ ROUTE_NODES=(
 )
 
 #-----------------------------------------------------------------------
-# 配置区: 测速节点
-# 两种写法:
-#   "12345|标签"           固定 server id
-#   "search:关键词|标签"    运行时按关键词查询 speedtest.net 官方接口取最新 id (推荐, 防失效)
-# 标记 * 的为 --fast 精简模式保留节点
+# 配置区: 测速节点  格式: 来源|标签|后备ID(逗号分隔,可空)|测试数量(可空,默认1)
+# 来源三种写法:
+#   nearest                          就近节点
+#   12345                            固定 server id
+#   search:关键词[@国家];关键词2...   运行时查询官方接口取最新节点(推荐)
+#     - 多个关键词用 ; 分隔, 依次尝试直到搜到结果
+#     - @国家 表示只保留该国家的节点 (避免匹配到 China Telecom Americas 之类的海外节点)
+# 搜索结果与后备 ID 组成候选池, 失败自动换下一个候选, 直到凑满"测试数量"
+# 标签末尾带 * 的为 --fast 精简模式保留节点 (fast 下每条目只测 1 个)
 #-----------------------------------------------------------------------
 SPEED_CN_NODES=(
-  "search:China Telecom|电信 *"
-  "search:Shanghai CT|电信-上海"
-  "search:Nanjing|电信-江苏"
-  "search:China Unicom|联通 *"
-  "search:Shanghai Unicom|联通-上海"
-  "search:China Mobile Group|移动 *"
-  "search:Beijing Mobile|移动-北京"
+  "search:China Telecom@China;CT5G@China;Telecom@China|电信 *|3633,5396,27594|2"
+  "search:China Unicom@China;Unicom@China|联通 *|24447,13704|2"
+  "search:China Mobile@China;CMCC@China;Mobile@China|移动 *|25858,4575|2"
 )
 
 SPEED_GLOBAL_NODES=(
   "nearest|就近节点 *"
-  "search:Hong Kong|亚太-香港 *"
-  "search:Taipei|亚太-台北"
-  "search:Tokyo|亚太-东京 *"
-  "search:Singapore|亚太-新加坡"
-  "search:Seoul|亚太-首尔"
-  "search:Frankfurt|欧洲-法兰克福 *"
-  "search:London|欧洲-伦敦"
-  "search:Amsterdam|欧洲-阿姆斯特丹"
-  "search:Los Angeles|北美-洛杉矶 *"
-  "search:San Jose|北美-圣何塞"
-  "search:New York|北美-纽约"
+  "search:Hong Kong@Hong Kong|亚太-香港 *"
+  "search:Taipei;Taiwan|亚太-台北"
+  "search:Tokyo@Japan|亚太-东京 *"
+  "search:Singapore@Singapore|亚太-新加坡"
+  "search:Seoul@South Korea;Seoul|亚太-首尔"
+  "search:Frankfurt@Germany|欧洲-法兰克福 *"
+  "search:London@United Kingdom|欧洲-伦敦"
+  "search:Amsterdam@Netherlands|欧洲-阿姆斯特丹"
+  "search:Los Angeles@United States|北美-洛杉矶 *"
+  "search:San Jose@United States|北美-圣何塞"
+  "search:New York@United States|北美-纽约"
 )
 
 #-----------------------------------------------------------------------
@@ -442,17 +442,28 @@ module_route() {
 #-----------------------------------------------------------------------
 # 模块: 测速 (全国 / 全球共用)
 #-----------------------------------------------------------------------
-resolve_server_id() {
-  # search:关键词 -> 通过官方接口查询最新 server id
-  local keyword="$1" resp id
-  resp=$(curl -fsSL --max-time 10 \
-    "https://www.speedtest.net/api/js/servers?engine=js&limit=3&search=$(echo "$keyword" | sed 's/ /%20/g')" 2>/dev/null)
-  if command -v jq >/dev/null 2>&1; then
-    id=$(echo "$resp" | jq -r '.[0].id // empty' 2>/dev/null)
-  else
-    id=$(echo "$resp" | grep -oE '"id":"?[0-9]+' | head -1 | grep -oE '[0-9]+')
-  fi
-  echo "$id"
+resolve_server_ids() {
+  # $1="关键词[@国家];关键词2..."  $2=最多返回几个 id
+  # 依次尝试每个关键词, 第一个有结果的关键词返回其节点 id 列表(每行一个)
+  local spec="$1" max="${2:-5}" kw country resp ids
+  local IFS=';'
+  for kw in $spec; do
+    unset IFS
+    country=""
+    [[ "$kw" == *@* ]] && { country="${kw#*@}"; kw="${kw%@*}"; }
+    resp=$(curl -fsSL --max-time 10 \
+      "https://www.speedtest.net/api/js/servers?engine=js&limit=20&search=$(echo "$kw" | sed 's/ /%20/g')" 2>/dev/null)
+    [[ -z "$resp" ]] && continue
+    if command -v jq >/dev/null 2>&1; then
+      ids=$(echo "$resp" | jq -r --arg c "$country" \
+        '.[] | select($c=="" or .country==$c) | .id' 2>/dev/null | head -n "$max")
+    else
+      # 无 jq 时的降级解析 (不支持国家过滤)
+      ids=$(echo "$resp" | grep -oE '"id":"?[0-9]+' | grep -oE '[0-9]+' | head -n "$max")
+    fi
+    [[ -n "$ids" ]] && { echo "$ids"; return 0; }
+  done
+  return 1
 }
 
 run_speed_one() {
@@ -462,7 +473,7 @@ run_speed_one() {
   [[ "$id" != "nearest" ]] && args+=(-s "$id")
   json=$(timeout 180 "$SPEEDTEST_BIN" "${args[@]}" 2>/dev/null)
   if [[ -z "$json" ]] || ! echo "$json" | jq -e '.download.bandwidth' >/dev/null 2>&1; then
-    printf " %-18s ${RED}%s${PLAIN}\n" "$label" "测试失败/节点不可用, 已跳过"
+    # 静默失败, 由调用方决定是否换候选节点重试
     return 1
   fi
   dl=$(echo "$json"  | jq -r '.download.bandwidth' | awk '{printf "%.1f", $1*8/1000000}')
@@ -485,24 +496,40 @@ run_speed_group() {
   printf "${BOLD} %-18s %10s %10s %9s %9s %7s  %s${PLAIN}\n" \
     "节点" "下载(Mbps)" "上传(Mbps)" "延迟(ms)" "抖动(ms)" "丢包" "实际服务器"
   hr
-  local node src label id
+  local tested_ids=" " node src label fallback count candidates id success
   for node in "${nodes[@]}"; do
-    src="${node%%|*}"; label="${node##*|}"
-    # --fast 模式只保留带 * 标记的节点
+    IFS='|' read -r src label fallback count <<< "$node"
+    # --fast 模式只保留带 * 标记的节点, 且每条目只测 1 个
     if [[ $FAST_MODE -eq 1 && "$label" != *\** ]]; then continue; fi
     label="${label% \*}"
+    count="${count:-1}"
+    [[ $FAST_MODE -eq 1 ]] && count=1
+
+    # 组装候选池: 搜索结果在前, 静态后备 id 在后
     if [[ "$src" == "nearest" ]]; then
-      id="nearest"
+      candidates="nearest"
     elif [[ "$src" == search:* ]]; then
-      id=$(resolve_server_id "${src#search:}")
-      if [[ -z "$id" ]]; then
-        printf " %-18s ${YELLOW}%s${PLAIN}\n" "$label" "未找到可用节点(接口查询失败), 已跳过"
-        continue
-      fi
+      candidates="$(resolve_server_ids "${src#search:}" 8) ${fallback//,/ }"
     else
-      id="$src"
+      candidates="$src ${fallback//,/ }"
     fi
-    run_speed_one "$id" "$label"
+    candidates=$(echo "$candidates" | tr ' \n' '\n\n' | grep -vE '^$')
+    if [[ -z "$candidates" ]]; then
+      printf " %-18s ${YELLOW}%s${PLAIN}\n" "$label" "未搜到该地区/运营商的测速节点, 已跳过"
+      continue
+    fi
+
+    # 依次尝试候选, 失败静默换下一个, 直到凑满 count 个成功结果
+    success=0
+    for id in $candidates; do
+      [[ "$tested_ids" == *" $id "* ]] && continue
+      tested_ids+="$id "
+      run_speed_one "$id" "$label" && success=$((success+1))
+      [[ $success -ge $count ]] && break
+    done
+    if [[ $success -eq 0 ]]; then
+      printf " %-18s ${RED}%s${PLAIN}\n" "$label" "全部候选节点测试失败, 已跳过"
+    fi
   done
   hr
 }
